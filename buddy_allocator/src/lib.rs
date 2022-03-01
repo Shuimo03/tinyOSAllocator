@@ -4,6 +4,7 @@
 #[cfg(test)]
 #[macro_use]
 extern crate std;
+extern crate alloc;
 
 #[cfg(feature = "use_spin")]
 extern crate spin;
@@ -113,13 +114,162 @@ impl <const ORDER: usize> Heap<ORDER> {
         Err(())
     }
 
+    // 从堆上回收内存
     pub fn dealloc(&mut self, ptr: NonNull<u8>, layout:Layout){
         let size = max(
             layout.size().next_power_of_two(),
-         max(layout.align(), size_of::<usize>()),
+            max(layout.align(), size_of::<usize>()),
         );
+        let class = size.trailing_zeros() as usize;
+
+        unsafe{
+            //回收块到链表中
+            self.free_list[class].push(ptr.as_ptr() as *mut usize);
+            //合并伙伴块
+            let mut current_ptr = ptr.as_ptr() as usize;
+            let mut current_class = class;
+            while current_class < self.free_list.len(){
+                let buddy = current_ptr ^ (1 << current_class);
+                let mut flag = false;
+                for block in self.free_list[current_class].iter_mut(){
+                    if block.value() as usize == buddy{
+                        block.pop();
+                        flag = true;
+                        break;
+                    }
+                }
+
+                //Free buddy found
+                if flag{
+                    self.free_list[current_class].pop();
+                    current_ptr = min(current_ptr,buddy);
+                    current_class += 1;
+                    self.free_list[current_class].push(current_ptr as *mut usize);
+                }else{
+                    break;
+                }
+            }
+        }
+        self.user -= layout.size();
+        self.allocated -= size;
+    }
+
+    pub fn stats_alloc_user(&self) -> usize{
+        self.user
+    }
+
+    pub fn stats_alloc_actual(&self) -> usize{
+        self.allocated
     }
 }
+
+impl <const ORDER: usize> fmt::Debug for Heap<ORDER> {
+    fn fmt(&self,fmt:&mut fmt::Formatter) -> fmt::Result{
+        fmt.debug_struct("Heap")
+            .field("user", &self.user)
+            .field("allocated", &self.allocated)
+            .field("total", &self.sum)
+            .finish()
+    }
+}
+
+#[cfg(feature = "use_spin")]
+pub struct LockedHeap<const ORDER: usize>(Mutex<Heap<ORDER>>);
+
+#[cfg(feature = "use_sin")]
+impl <const ORDER: usize> LockedHeap {
+    pub const fn new() -> Self{
+        LockedHeap(Mutex::new(Heap::<ORDER>::new()))
+    }
+
+    pub const fn empty() -> Self{
+        LockedHeap(Mutex::new(Heap::<ORDER>::new()))
+    }
+}
+
+#[cfg(feature = "use_spin")]
+impl <const ORDER:usize> Deref for LockedHeap<ORDER> {
+    type Target = Mutex<Heap<ORDER>>;
+
+    fn deref(&self) -> &Self::Target{
+        &self.0
+    }
+}
+
+#[cfg(feature="use_spin")]
+unsafe impl <const ORDER: usize> GlobalAlloc for LockedHeap<ORDER>{
+
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.0
+            .lock()
+            .alloc(layout)
+            .ok()
+            .map_or(0 as *mut u8, |allocation| allocation.as_ptr())
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout){
+        self.0.lock().dealloc(NonNull::new_unchecked(ptr), layout)
+    }
+}
+
+
+#[cfg(feature = "use_spin")]
+pub struct LockedHeapWithRescue<const ORDER: usize>{
+    inner: Mutex<Heap<ORDER>>,
+    rescue: fn(&mut Heap<ORDER>, &Layout),
+}
+
+#[cfg(feature = "use_spin")]
+impl <const ORDER: usize> LockedHeapWithRescue<ORDER> {
+    #[cfg(feature="const_fn")]
+    pub const fn new(rescue: fn(&mut Heap<ORDER>, &Layout)) -> Self{
+        LockedHeapWithRescue {
+            inner: Mutex::new(Heap::<ORDER>::new()),
+            rescue,
+        }
+    }
+
+    #[cfg(not(feature = "const_fn"))]
+    pub fn new(rescue: fn(&mut Heap<ORDER>, &Layout))->Self{
+        LockedHeapWithRescue{
+            inner:Mutex::new(Heap::<ORDER>::new()),
+            rescue,
+        }
+    }
+}
+
+#[cfg(feature="use_spin")]
+impl <const ORDER: usize> Deref for LockedHeapWithRescue<ORDER>{
+    type  Target = Mutex<Heap<ORDER>>;
+
+    fn deref(&self) -> &Self::Target{
+        &self.inner
+    }
+}
+
+#[cfg(feature="use_spin")]
+unsafe impl <const ORDER:usize> GlobalAlloc for LockedHeapWithRescue<ORDER> { 
+    unsafe fn alloc(&self,layout:Layout) -> *mut u8{
+        let mut inner = self.inner.lock();
+        match inner.alloc(layout){
+            Ok(allocation) => allocation.as_ptr(),
+            Err(_) => {
+                (self.rescue)(&mut inner, &layout);
+                inner
+                    .alloc(layout)
+                    .ok()
+                    .map_or(0 as *mut u8, |allocation| allocation.as_ptr())
+            }
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout:Layout){
+        self.inner
+        .lock()
+        .dealloc(NonNull::new_unchecked(ptr), layout)
+    }
+}
+
 
 pub(crate) fn prev_power_of_two(num: usize) ->usize{
     1 << (8 * (size_of::<usize>()) - num.leading_zeros() as usize - 1)
